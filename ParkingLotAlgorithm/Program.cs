@@ -6,7 +6,8 @@
 var workloads = new List<WorkloadTest>
 {
     new WorkloadTest(1, 750, 500),
-    new WorkloadTest(2, 750, 1000)
+    new WorkloadTest(2, 750, 1000), // impossible workload
+    new WorkloadTest(3, 250, 1000) // impossible workload
 };
 
 // ----------------------
@@ -48,17 +49,14 @@ CpModel model = new CpModel();
 // ----------------------
 // Variables
 // ----------------------
-
-// amount[j,a] = minutes workload j uses on availability a
 IntVar[,] amount = new IntVar[numWorkload, numAvail];
-
-// used[j,a] = 1 if workload j uses availability a
 BoolVar[,] used = new BoolVar[numWorkload, numAvail];
 
-// assign[j,r] = workload j assigned to resource r
 var resourceIds = availabilities.Select(a => a.ResourceId).Distinct().ToList();
 int numResources = resourceIds.Count;
+
 BoolVar[,] assign = new BoolVar[numWorkload, numResources];
+BoolVar[] workloadUsed = new BoolVar[numWorkload];
 
 List<IntVar> allAssigned = new();
 
@@ -67,41 +65,39 @@ List<IntVar> allAssigned = new();
 // ----------------------
 for (int j = 0; j < numWorkload; j++)
 {
+    workloadUsed[j] = model.NewBoolVar($"workloadUsed_{j}");
+
     for (int r = 0; r < numResources; r++)
         assign[j, r] = model.NewBoolVar($"assign_W{j}_R{resourceIds[r]}");
 
     for (int a = 0; a < numAvail; a++)
     {
-        amount[j, a] = model.NewIntVar(
-            0,
-            availabilities[a].TotalMinutes,
-            $"amt_W{j}_A{a}"
-        );
-
+        amount[j, a] = model.NewIntVar(0, availabilities[a].TotalMinutes, $"amt_W{j}_A{a}");
         used[j, a] = model.NewBoolVar($"used_W{j}_A{a}");
-
         allAssigned.Add(amount[j, a]);
     }
 }
 
 // ----------------------
-// Objective: maximize total assigned minutes
+// Objective
 // ----------------------
-model.Maximize(LinearExpr.Sum(allAssigned));
+model.Maximize(
+    LinearExpr.Sum(allAssigned) + 10000 * LinearExpr.Sum(workloadUsed)
+);
 
 // ===================================================
 // Constraints
 // ===================================================
 
 // -----------------------------
-// Each workload selects exactly ONE resource
+// Optional resource assignment
 // -----------------------------
 for (int j = 0; j < numWorkload; j++)
 {
     model.Add(
         LinearExpr.Sum(
             Enumerable.Range(0, numResources).Select(r => assign[j, r])
-        ) == 1
+        ) == workloadUsed[j]
     );
 }
 
@@ -132,7 +128,26 @@ for (int j = 0; j < numWorkload; j++)
 }
 
 // -----------------------------------------
-// CONTINUITY per resource (no gaps)
+// LIFT CAPACITY VALIDATION
+// -----------------------------------------
+var resourceLift = availabilities
+    .GroupBy(a => a.ResourceId)
+    .ToDictionary(g => g.Key, g => g.First().EffectiveLiftTonnes);
+
+for (int j = 0; j < numWorkload; j++)
+{
+    for (int r = 0; r < numResources; r++)
+    {
+        int resourceId = resourceIds[r];
+        if (resourceLift[resourceId] < workloads[j].weightToLiftTonnes)
+        {
+            model.Add(assign[j, r] == 0);
+        }
+    }
+}
+
+// -----------------------------------------
+// CONTINUITY (no gaps)
 // -----------------------------------------
 for (int j = 0; j < numWorkload; j++)
 {
@@ -156,19 +171,19 @@ for (int j = 0; j < numWorkload; j++)
 }
 
 // -----------------------------------------
-// Workload duration (partial allowed)
+// Workload duration
 // -----------------------------------------
 for (int j = 0; j < numWorkload; j++)
 {
     model.Add(
         LinearExpr.Sum(
             Enumerable.Range(0, numAvail).Select(a => amount[j, a])
-        ) <= workloads[j].durationInMinutes
+        ) <= workloads[j].durationInMinutes * workloadUsed[j]
     );
 }
 
 // -----------------------------------------
-// Daily capacity per availability
+// Daily capacity
 // -----------------------------------------
 for (int a = 0; a < numAvail; a++)
 {
@@ -188,28 +203,29 @@ solver.StringParameters = "max_time_in_seconds:10";
 var status = solver.Solve(model);
 Console.WriteLine($"Status: {status}\n");
 
-foreach (var workload in workloads)
-{
-    Console.WriteLine($"Workload-{workload.id} : {workload.durationInMinutes}");
-}
-
+// ----------------------
+// Output
+// ----------------------
 if (status == CpSolverStatus.Optimal || status == CpSolverStatus.Feasible)
 {
-    // Group availabilities by resource
+    for (int j = 0; j < numWorkload; j++)
+    {
+        Console.WriteLine(
+            $"Workload {workloads[j].id} " +
+            (solver.Value(workloadUsed[j]) == 1 ? "SCHEDULED" : "NOT SCHEDULED")
+        );
+    }
+
     var availByResource = availabilities
         .Select((a, idx) => new { Availability = a, Index = idx })
-        .GroupBy(x => x.Availability.ResourceId)
-        .OrderBy(g => g.Key);
+        .GroupBy(x => x.Availability.ResourceId);
 
     foreach (var resourceGroup in availByResource)
     {
-        int resourceId = resourceGroup.Key;
-        Console.WriteLine($"\nResource {resourceId} ({resourceGroup.First().Availability.TotalMinutes} min/day):\n");
+        Console.WriteLine($"\nResource {resourceGroup.Key}");
 
         foreach (var workload in workloads.Select((w, j) => new { w, j }))
         {
-            Console.WriteLine($"  Workload W{workload.w.id}:");
-
             int total = 0;
 
             foreach (var entry in resourceGroup.OrderBy(x => x.Availability.Date))
@@ -218,17 +234,11 @@ if (status == CpSolverStatus.Optimal || status == CpSolverStatus.Feasible)
                 total += minutes;
 
                 if (minutes > 0)
-                {
-                    Console.WriteLine(
-                        $"    Date {entry.Availability.Date}: {minutes} minutes"
-                    );
-                }
+                    Console.WriteLine($"  W{workload.w.id} - Day {entry.Availability.Date}: {minutes} min");
             }
 
-            Console.WriteLine($"    Total on Resource {resourceId}: {total} min\n");
+            if (total > 0)
+                Console.WriteLine($"  TOTAL W{workload.w.id}: {total} min");
         }
-
-        Console.WriteLine("-----------------------------");
     }
 }
-
