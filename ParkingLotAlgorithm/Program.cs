@@ -1,197 +1,231 @@
-﻿// ----------------------
+﻿using Google.OrTools.Sat;
+
+// ----------------------
 // Workloads
 // ----------------------
-using Google.OrTools.Sat;
-
 var workloads = new List<WorkloadTest>
-        {
-            new WorkloadTest(1, 750),
-            new WorkloadTest(2, 7500)
-        };
+{
+    new WorkloadTest(1, 750, 500),
+    new WorkloadTest(2, 750, 1000)
+};
 
 // ----------------------
-// 2 Resources, each 100 min/day for 10 days
+// Resource availability (resource × date)
 // ----------------------
-var resources = new List<ResourceAvailabilityTest>
-        {
-            new ResourceAvailabilityTest(1, 100),   // R1: 100 min/day
-            new ResourceAvailabilityTest(2, 100)    // R2: 100 min/day
-        };
+var availabilities = new List<ResourceAvailabilityTest>
+{
+    new ResourceAvailabilityTest(1, 1, 100, 500),
+    new ResourceAvailabilityTest(1, 2, 100, 500),
+    new ResourceAvailabilityTest(1, 3, 100, 500),
+    new ResourceAvailabilityTest(1, 4, 100, 500),
+    new ResourceAvailabilityTest(1, 5, 100, 500),
+    new ResourceAvailabilityTest(1, 6, 100, 500),
+    new ResourceAvailabilityTest(1, 7, 100, 500),
+    new ResourceAvailabilityTest(1, 8, 100, 500),
+    new ResourceAvailabilityTest(1, 9, 100, 500),
+    new ResourceAvailabilityTest(1,10, 100, 500),
+
+    new ResourceAvailabilityTest(2, 1, 100, 1000),
+    new ResourceAvailabilityTest(2, 2, 100, 1000),
+    new ResourceAvailabilityTest(2, 3, 100, 1000),
+    new ResourceAvailabilityTest(2, 4, 100, 1000),
+    new ResourceAvailabilityTest(2, 5, 100, 1000),
+    new ResourceAvailabilityTest(2, 6, 100, 1000),
+    new ResourceAvailabilityTest(2, 7, 100, 1000),
+    new ResourceAvailabilityTest(2, 8, 100, 1000),
+    new ResourceAvailabilityTest(2, 9, 100, 1000),
+    new ResourceAvailabilityTest(2,10, 100, 1000),
+};
 
 int numWorkload = workloads.Count;
-int numResources = resources.Count;
-int numDays = 10;
+int numAvail = availabilities.Count;
 
+// ----------------------
 // Build model
+// ----------------------
 CpModel model = new CpModel();
 
-// assign[j,r] = workload j is assigned to resource r
+// ----------------------
+// Variables
+// ----------------------
+
+// amount[j,a] = minutes workload j uses on availability a
+IntVar[,] amount = new IntVar[numWorkload, numAvail];
+
+// used[j,a] = 1 if workload j uses availability a
+BoolVar[,] used = new BoolVar[numWorkload, numAvail];
+
+// assign[j,r] = workload j assigned to resource r
+var resourceIds = availabilities.Select(a => a.ResourceId).Distinct().ToList();
+int numResources = resourceIds.Count;
 BoolVar[,] assign = new BoolVar[numWorkload, numResources];
 
-// amount[j][r][d] = minutes workload j uses on resource r on day d
-IntVar[,,] amount = new IntVar[numWorkload, numResources, numDays];
+List<IntVar> allAssigned = new();
 
+// ----------------------
+// Create variables
+// ----------------------
 for (int j = 0; j < numWorkload; j++)
 {
     for (int r = 0; r < numResources; r++)
+        assign[j, r] = model.NewBoolVar($"assign_W{j}_R{resourceIds[r]}");
+
+    for (int a = 0; a < numAvail; a++)
     {
-        for (int d = 0; d < numDays; d++)
+        amount[j, a] = model.NewIntVar(
+            0,
+            availabilities[a].TotalMinutes,
+            $"amt_W{j}_A{a}"
+        );
+
+        used[j, a] = model.NewBoolVar($"used_W{j}_A{a}");
+
+        allAssigned.Add(amount[j, a]);
+    }
+}
+
+// ----------------------
+// Objective: maximize total assigned minutes
+// ----------------------
+model.Maximize(LinearExpr.Sum(allAssigned));
+
+// ===================================================
+// Constraints
+// ===================================================
+
+// -----------------------------
+// Each workload selects exactly ONE resource
+// -----------------------------
+for (int j = 0; j < numWorkload; j++)
+{
+    model.Add(
+        LinearExpr.Sum(
+            Enumerable.Range(0, numResources).Select(r => assign[j, r])
+        ) == 1
+    );
+}
+
+// -----------------------------------------
+// Link amount ↔ used
+// -----------------------------------------
+for (int j = 0; j < numWorkload; j++)
+{
+    for (int a = 0; a < numAvail; a++)
+    {
+        model.Add(amount[j, a] >= 1).OnlyEnforceIf(used[j, a]);
+        model.Add(amount[j, a] == 0).OnlyEnforceIf(used[j, a].Not());
+    }
+}
+
+// -----------------------------------------
+// Enforce resource assignment
+// -----------------------------------------
+for (int j = 0; j < numWorkload; j++)
+{
+    for (int a = 0; a < numAvail; a++)
+    {
+        int rIndex = resourceIds.IndexOf(availabilities[a].ResourceId);
+        model.Add(
+            amount[j, a] <= availabilities[a].TotalMinutes * assign[j, rIndex]
+        );
+    }
+}
+
+// -----------------------------------------
+// CONTINUITY per resource (no gaps)
+// -----------------------------------------
+for (int j = 0; j < numWorkload; j++)
+{
+    foreach (var rId in resourceIds)
+    {
+        var seq = availabilities
+            .Select((a, idx) => new { a, idx })
+            .Where(x => x.a.ResourceId == rId)
+            .OrderBy(x => x.a.Date)
+            .ToList();
+
+        for (int k = 1; k < seq.Count; k++)
         {
-            assign[j, r] = model.NewBoolVar($"assign_W{j}_R{r}");
-            amount[j, r, d] = model.NewIntVar(
-                0,
-                resources[r].TotalMinutes,
-                $"amt_W{j}_R{r}_D{d}"
+            model.Add(used[j, seq[k].idx] <= used[j, seq[k - 1].idx]);
+            model.Add(
+                amount[j, seq[k - 1].idx] >=
+                seq[k - 1].a.TotalMinutes * used[j, seq[k].idx]
             );
         }
     }
 }
 
-//// ----------------------
-//// Each job must receive exactly duration minutes total across all days and resources
-//// ----------------------
-//for (int j = 0; j < numJobs; j++)
-//{
-//    List<IntVar> parts = new();
-//    for (int r = 0; r < numResources; r++)
-//        for (int d = 0; d < numDays; d++)
-//            parts.Add(amount[j, r, d]);
-
-//    model.Add(LinearExpr.Sum(parts) == workloads[j].durationInMinutes);
-//}
-
-// -----------------------------
-// Each workload must select EXACTLY ONE resource
-// -----------------------------
-for (int j = 0; j < numWorkload; j++)
-{
-    List<BoolVar> choices = new();
-    for (int r = 0; r < numResources; r++)
-        choices.Add(assign[j, r]);
-
-    model.Add(LinearExpr.Sum(choices) == 1);
-}
-
-//// ----------------------
-//// Daily capacity per resource cannot exceed 100 minutes
-//// ----------------------
-//for (int r = 0; r < numResources; r++)
-//{
-//    for (int d = 0; d < numDays; d++)
-//    {
-//        List<IntVar> dayLoad = new();
-//        for (int j = 0; j < numJobs; j++)
-//            dayLoad.Add(amount[j, r, d]);
-
-//        model.Add(LinearExpr.Sum(dayLoad) <= resources[r].TotalMinutes);
-//    }
-//}
-
-
-// -----------------------------
-// Each workload must select EXACTLY ONE resource
-// -----------------------------
-//for (int j = 0; j < numWorkload; j++)
-//{
-//    List<BoolVar> choices = new();
-//    for (int r = 0; r < numResources; r++)
-//        choices.Add(assign[j, r]);
-
-//    model.Add(LinearExpr.Sum(choices) == 1);
-//}
-
 // -----------------------------------------
-// If workload j is NOT assigned to resource r
-// amount[j,r,d] = 0
+// Workload duration (partial allowed)
 // -----------------------------------------
 for (int j = 0; j < numWorkload; j++)
 {
-    for (int r = 0; r < numResources; r++)
-    {
-        for (int d = 0; d < numDays; d++)
-        {
-            // amount <= assign * 100
-            model.Add(amount[j, r, d] <= resources[r].TotalMinutes * assign[j, r]);
-        }
-    }
-}
-
-// -----------------------------
-// Each job must receive exactly its required minutes
-// -----------------------------
-for (int j = 0; j < numWorkload; j++)
-{
-    List<IntVar> sumParts = new();
-
-    for (int r = 0; r < numResources; r++)
-        for (int d = 0; d < numDays; d++)
-            sumParts.Add(amount[j, r, d]);
-
-    model.Add(LinearExpr.Sum(sumParts) == workloads[j].durationInMinutes);
+    model.Add(
+        LinearExpr.Sum(
+            Enumerable.Range(0, numAvail).Select(a => amount[j, a])
+        ) <= workloads[j].durationInMinutes
+    );
 }
 
 // -----------------------------------------
-// DAILY CAPACITY: resource r can give only 100 minutes/day
+// Daily capacity per availability
 // -----------------------------------------
-for (int r = 0; r < numResources; r++)
+for (int a = 0; a < numAvail; a++)
 {
-    for (int d = 0; d < numDays; d++)
-    {
-        List<IntVar> loads = new();
-
-        for (int j = 0; j < numWorkload; j++)
-            loads.Add(amount[j, r, d]);
-
-        model.Add(LinearExpr.Sum(loads) <= 100);
-    }
+    model.Add(
+        LinearExpr.Sum(
+            Enumerable.Range(0, numWorkload).Select(j => amount[j, a])
+        ) <= availabilities[a].TotalMinutes
+    );
 }
 
 // ----------------------
-// Objective: Just find feasible solution
-// ----------------------
-//model.Maximize(1);
-
 // Solve
+// ----------------------
 CpSolver solver = new CpSolver();
 solver.StringParameters = "max_time_in_seconds:10";
 
 var status = solver.Solve(model);
-
 Console.WriteLine($"Status: {status}\n");
 
 foreach (var workload in workloads)
 {
-    Console.WriteLine($" Workload-{workload.id} : {workload.durationInMinutes}");
+    Console.WriteLine($"Workload-{workload.id} : {workload.durationInMinutes}");
 }
 
 if (status == CpSolverStatus.Optimal || status == CpSolverStatus.Feasible)
 {
-    for (int r = 0; r < numResources; r++)
-    {
-        Console.WriteLine($"Resource {resources[r].Id} (100 min/day):\n");
+    // Group availabilities by resource
+    var availByResource = availabilities
+        .Select((a, idx) => new { Availability = a, Index = idx })
+        .GroupBy(x => x.Availability.ResourceId)
+        .OrderBy(g => g.Key);
 
-        for (int j = 0; j < numWorkload; j++)
+    foreach (var resourceGroup in availByResource)
+    {
+        int resourceId = resourceGroup.Key;
+        Console.WriteLine($"\nResource {resourceId} ({resourceGroup.First().Availability.TotalMinutes} min/day):\n");
+
+        foreach (var workload in workloads.Select((w, j) => new { w, j }))
         {
-            Console.WriteLine($"  Workload W{workloads[j].id}:");
+            Console.WriteLine($"  Workload W{workload.w.id}:");
 
             int total = 0;
-            for (int d = 0; d < numDays; d++)
-            {
-                try
-                {
-                    int mins = (int)solver.Value(amount[j, r, d]);
-                    total += mins;
-                    if (mins > 0)
-                        Console.WriteLine($"    Day {d + 1}: {mins} minutes");
-                }
-                catch (Exception)
-                {
-                    Console.WriteLine($"    Day {d + 1}: 0 minutes");
-                    // ignored
-                }
 
+            foreach (var entry in resourceGroup.OrderBy(x => x.Availability.Date))
+            {
+                int minutes = (int)solver.Value(amount[workload.j, entry.Index]);
+                total += minutes;
+
+                if (minutes > 0)
+                {
+                    Console.WriteLine(
+                        $"    Date {entry.Availability.Date}: {minutes} minutes"
+                    );
+                }
             }
-            Console.WriteLine($"    Total on R{resources[r].Id}: {total} min\n");
+
+            Console.WriteLine($"    Total on Resource {resourceId}: {total} min\n");
         }
 
         Console.WriteLine("-----------------------------");

@@ -5,13 +5,16 @@ using ParkingLotAlgorithm;
 
 public class ResourceAvailabilityTest
 {
-    public ResourceAvailabilityTest(int Id, int TotalMinutes)
+    public ResourceAvailabilityTest(int resourceId, int date, int totalMinutes, int effectiveLiftTonnes)
     {
-        this.Id = Id;
-        this.TotalMinutes = TotalMinutes;
+        ResourceId = resourceId;
+        Date = date;
+        TotalMinutes = totalMinutes;
+        EffectiveLiftTonnes = effectiveLiftTonnes;
     }
 
-    public int Id { get; }
-
-    public readonly int TotalMinutes;
+    public int ResourceId { get; }
+    public int Date { get; }          // e.g. 20240101 or DayIndex
+    public int TotalMinutes { get; }
+    public int EffectiveLiftTonnes { get; }
 }
