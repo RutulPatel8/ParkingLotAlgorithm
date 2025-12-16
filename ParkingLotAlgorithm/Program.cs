@@ -1,38 +1,47 @@
-﻿using Google.OrTools.Sat;
-
-
-// ----------------------
+﻿// ----------------------
 // Workloads
 // ----------------------
+using Google.OrTools.Sat;
+
 var workloads = new List<WorkloadTest>
         {
-            new WorkloadTest(1, 750, 500),
-            new WorkloadTest(2, 250, 1000)
+            new WorkloadTest(1, 200, 500),
+            new WorkloadTest(2, 300, 1000),
+            new WorkloadTest(3, 200, 1000),
+            new WorkloadTest(4, 200, 1000),
         };
 
 // ----------------------
-// Resource availability
+// Resource availability (GLOBAL DAYS)
+// Resource 2 missing Day 9 & 10
 // ----------------------
 var availabilities = new List<ResourceAvailabilityTest>();
 
-for (int d = 1; d <= 10; d++)
+for (int d = 1; d <= 13; d++)
     availabilities.Add(new ResourceAvailabilityTest(1, d, 100, 500));
 
-for (int d = 1; d <= 13; d++)
+for (int d = 1; d <= 8; d++)
     availabilities.Add(new ResourceAvailabilityTest(2, d, 100, 1000));
 
-// workload indices (not IDs)
-var dependencies = new List<(int before, int after)>
-{
-    (0, 1), // Workload 1 must finish before Workload 2 starts
-    // add more if needed
-};
+for (int d = 11; d <= 13; d++)
+    availabilities.Add(new ResourceAvailabilityTest(2, d, 100, 1000));
 
+// ----------------------
+// Dependencies (index-based)
+// Workload 1 must finish before Workload 2
+// ----------------------
+var dependencies = new List<(int before, int after)>
+        {
+            (0, 1),
+            (2, 3)
+        };
 
 // ----------------------
 // Build model
 // ----------------------
 CpModel model = new CpModel();
+
+int horizon = availabilities.Max(a => a.Date) + 10;
 
 var resources = availabilities
     .GroupBy(a => a.ResourceId)
@@ -45,7 +54,7 @@ var intervals = new Dictionary<(int w, int r), IntervalVar>();
 var presence = new Dictionary<(int w, int r), BoolVar>();
 
 // ----------------------
-// Create intervals
+// Create workload intervals (GLOBAL TIME)
 // ----------------------
 for (int w = 0; w < workloads.Count; w++)
 {
@@ -56,26 +65,23 @@ for (int w = 0; w < workloads.Count; w++)
         int resourceId = r.Key;
         var days = r.Value;
 
-        // Lift validation
-        if (days[0].EffectiveLiftTonnes < workload.weightToLiftTonnes)
+        if (days.All(d => d.EffectiveLiftTonnes < workload.weightToLiftTonnes))
             continue;
 
-        int dayMinutes = days[0].TotalMinutes;
-        int maxSlots = days.Count;
-        int requiredSlots = (int)Math.Ceiling(
-            workload.durationInMinutes / (double)dayMinutes
+        int minutesPerDay = days.First().TotalMinutes;
+        int requiredDays = (int)Math.Ceiling(
+            workload.durationInMinutes / (double)minutesPerDay
         );
 
-        if (requiredSlots > maxSlots)
-            continue;
-
-        var start = model.NewIntVar(0, maxSlots - 1, $"start_W{w}_R{resourceId}");
-        var length = model.NewIntVar(requiredSlots, requiredSlots, $"len_W{w}_R{resourceId}");
-        var end = model.NewIntVar(0, maxSlots, $"end_W{w}_R{resourceId}");
+        var start = model.NewIntVar(0, horizon, $"start_W{w}_R{resourceId}");
+        var end = model.NewIntVar(0, horizon + requiredDays, $"end_W{w}_R{resourceId}");
         var pres = model.NewBoolVar($"pres_W{w}_R{resourceId}");
 
         var interval = model.NewOptionalIntervalVar(
-            start, length, end, pres,
+            start,
+            requiredDays,
+            end,
+            pres,
             $"interval_W{w}_R{resourceId}"
         );
 
@@ -92,27 +98,52 @@ for (int w = 0; w < workloads.Count; w++)
 }
 
 // ----------------------
-// Resource capacity (No overlap)
+// Block unavailable days per resource
+// ----------------------
+var blockedIntervals = new Dictionary<int, List<IntervalVar>>();
+
+foreach (var r in resources)
+{
+    int resourceId = r.Key;
+    var availableDays = r.Value.Select(d => d.Date).ToHashSet();
+
+    blockedIntervals[resourceId] = new List<IntervalVar>();
+
+    for (int d = 1; d <= horizon; d++)
+    {
+        if (!availableDays.Contains(d))
+        {
+            var blocked = model.NewIntervalVar(
+                d,
+                1,
+                d + 1,
+                $"blocked_R{resourceId}_D{d}"
+            );
+            blockedIntervals[resourceId].Add(blocked);
+        }
+    }
+}
+
+// ----------------------
+// No overlap per resource
 // ----------------------
 foreach (var r in resources)
 {
     int resourceId = r.Key;
 
-    var resourceIntervals = intervals
+    var allIntervals = intervals
         .Where(x => x.Key.r == resourceId)
         .Select(x => x.Value)
         .ToList();
 
-    model.AddNoOverlap(resourceIntervals);
+    allIntervals.AddRange(blockedIntervals[resourceId]);
+
+    model.AddNoOverlap(allIntervals);
 }
 
 // ----------------------
-// Objective: maximize scheduled workloads
+// Dependencies
 // ----------------------
-model.Maximize(
-    LinearExpr.Sum(presence.Values) * 1000
-);
-
 foreach (var dep in dependencies)
 {
     int wBefore = dep.before;
@@ -143,13 +174,19 @@ foreach (var dep in dependencies)
     }
 }
 
+
+// ----------------------
+// Objective: maximize scheduled workloads
+// ----------------------
+model.Maximize(LinearExpr.Sum(presence.Values));
+
 // ----------------------
 // Solve
 // ----------------------
 CpSolver solver = new CpSolver();
 solver.StringParameters = "max_time_in_seconds:10";
-
 var status = solver.Solve(model);
+
 Console.WriteLine($"Status: {status}\n");
 
 // ----------------------
@@ -167,51 +204,24 @@ foreach (var w in workloads.Select((w, i) => new { w, i }))
 }
 
 Console.WriteLine("\n==============================");
-Console.WriteLine("DAY-WISE SCHEDULE PER RESOURCE");
+Console.WriteLine("SCHEDULE PER RESOURCE (GLOBAL DAYS)");
 Console.WriteLine("==============================\n");
 
-foreach (var r in resources)
+foreach (var r in resources.Keys)
 {
-    int resourceId = r.Key;
-    var days = r.Value;
+    Console.WriteLine($"Resource {r}");
 
-    Console.WriteLine($"Resource {resourceId}");
-
-    for (int d = 0; d < days.Count; d++)
+    foreach (var kv in intervals.Where(x => x.Key.r == r))
     {
-        int dayIndex = days[d].Date;
-        int? scheduledWorkload = null;
+        if (solver.Value(presence[kv.Key]) == 0)
+            continue;
 
-        foreach (var kv in intervals)
-        {
-            if (kv.Key.r != resourceId)
-                continue;
+        int start = (int)solver.Value(kv.Value.StartExpr());
+        int end = (int)solver.Value(kv.Value.EndExpr());
 
-            if (solver.Value(presence[kv.Key]) == 0)
-                continue;
-
-            int w = kv.Key.w;
-            var interval = kv.Value;
-
-            int start = (int)solver.Value(interval.StartExpr());
-            int len = (int)solver.Value(interval.SizeExpr());
-            int end = start + len - 1;
-
-            if (d >= start && d <= end)
-            {
-                scheduledWorkload = workloads[w].id;
-                break;
-            }
-        }
-
-        if (scheduledWorkload.HasValue)
-        {
-            Console.WriteLine($"  Day {dayIndex}: Workload {scheduledWorkload.Value}");
-        }
-        else
-        {
-            Console.WriteLine($"  Day {dayIndex}: FREE");
-        }
+        Console.WriteLine(
+            $"  Workload {workloads[kv.Key.w].id}: Day {start} → Day {end - 1}"
+        );
     }
 
     Console.WriteLine();
