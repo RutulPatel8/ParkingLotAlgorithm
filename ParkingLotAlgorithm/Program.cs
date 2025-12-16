@@ -6,9 +6,8 @@
 // ----------------------
 var workloads = new List<WorkloadTest>
         {
-            new WorkloadTest(1, 750, 5000),
-            new WorkloadTest(2, 750, 5000),
-            new WorkloadTest(3, 250, 5000)
+            new WorkloadTest(1, 750, 500),
+            new WorkloadTest(2, 250, 1000)
         };
 
 // ----------------------
@@ -20,7 +19,15 @@ for (int d = 1; d <= 10; d++)
     availabilities.Add(new ResourceAvailabilityTest(1, d, 100, 500));
 
 for (int d = 1; d <= 13; d++)
-    availabilities.Add(new ResourceAvailabilityTest(2, d, 100, 5000));
+    availabilities.Add(new ResourceAvailabilityTest(2, d, 100, 1000));
+
+// workload indices (not IDs)
+var dependencies = new List<(int before, int after)>
+{
+    (0, 1), // Workload 1 must finish before Workload 2 starts
+    // add more if needed
+};
+
 
 // ----------------------
 // Build model
@@ -106,6 +113,36 @@ model.Maximize(
     LinearExpr.Sum(presence.Values) * 1000
 );
 
+foreach (var dep in dependencies)
+{
+    int wBefore = dep.before;
+    int wAfter = dep.after;
+
+    foreach (var rBefore in resources.Keys)
+    {
+        foreach (var rAfter in resources.Keys)
+        {
+            if (!intervals.ContainsKey((wBefore, rBefore)))
+                continue;
+
+            if (!intervals.ContainsKey((wAfter, rAfter)))
+                continue;
+
+            var intervalBefore = intervals[(wBefore, rBefore)];
+            var intervalAfter = intervals[(wAfter, rAfter)];
+
+            var presBefore = presence[(wBefore, rBefore)];
+            var presAfter = presence[(wAfter, rAfter)];
+
+            // end_before <= start_after
+            model.Add(
+                intervalBefore.EndExpr() <= intervalAfter.StartExpr()
+            )
+            .OnlyEnforceIf(new[] { presBefore, presAfter });
+        }
+    }
+}
+
 // ----------------------
 // Solve
 // ----------------------
@@ -129,23 +166,53 @@ foreach (var w in workloads.Select((w, i) => new { w, i }))
     );
 }
 
-Console.WriteLine();
+Console.WriteLine("\n==============================");
+Console.WriteLine("DAY-WISE SCHEDULE PER RESOURCE");
+Console.WriteLine("==============================\n");
 
-foreach (var kv in intervals)
+foreach (var r in resources)
 {
-    if (solver.Value(presence[kv.Key]) == 0)
-        continue;
+    int resourceId = r.Key;
+    var days = r.Value;
 
-    int w = kv.Key.w;
-    int r = kv.Key.r;
+    Console.WriteLine($"Resource {resourceId}");
 
-    int start = (int)solver.Value(kv.Value.StartExpr());
-    int len = (int)solver.Value(kv.Value.SizeExpr());
+    for (int d = 0; d < days.Count; d++)
+    {
+        int dayIndex = days[d].Date;
+        int? scheduledWorkload = null;
 
-    Console.WriteLine(
-        $"Workload {workloads[w].id} → Resource {r} " +
-        $"from Day {resources[r][start].Date} " +
-        $"to Day {resources[r][start + len - 1].Date}"
-    );
+        foreach (var kv in intervals)
+        {
+            if (kv.Key.r != resourceId)
+                continue;
+
+            if (solver.Value(presence[kv.Key]) == 0)
+                continue;
+
+            int w = kv.Key.w;
+            var interval = kv.Value;
+
+            int start = (int)solver.Value(interval.StartExpr());
+            int len = (int)solver.Value(interval.SizeExpr());
+            int end = start + len - 1;
+
+            if (d >= start && d <= end)
+            {
+                scheduledWorkload = workloads[w].id;
+                break;
+            }
+        }
+
+        if (scheduledWorkload.HasValue)
+        {
+            Console.WriteLine($"  Day {dayIndex}: Workload {scheduledWorkload.Value}");
+        }
+        else
+        {
+            Console.WriteLine($"  Day {dayIndex}: FREE");
+        }
+    }
+
+    Console.WriteLine();
 }
-
