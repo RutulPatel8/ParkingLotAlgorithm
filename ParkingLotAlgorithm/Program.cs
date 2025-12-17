@@ -4,12 +4,10 @@
 using Google.OrTools.Sat;
 
 var workloads = new List<WorkloadTest>
-        {
-            new WorkloadTest(1, 200, 500),
-            new WorkloadTest(2, 300, 1000),
-            new WorkloadTest(3, 200, 1000),
-            new WorkloadTest(4, 200, 1000),
-        };
+{
+    new WorkloadTest(1, 750, 500, 250),
+    new WorkloadTest(2, 250, 1000, 500)
+};
 
 // ----------------------
 // Resource availability (GLOBAL DAYS)
@@ -18,23 +16,18 @@ var workloads = new List<WorkloadTest>
 var availabilities = new List<ResourceAvailabilityTest>();
 
 for (int d = 1; d <= 13; d++)
-    availabilities.Add(new ResourceAvailabilityTest(1, d, 100, 500));
+    availabilities.Add(new ResourceAvailabilityTest(1, d, 100, 500, 400));
 
-for (int d = 1; d <= 8; d++)
-    availabilities.Add(new ResourceAvailabilityTest(2, d, 100, 1000));
-
-for (int d = 11; d <= 13; d++)
-    availabilities.Add(new ResourceAvailabilityTest(2, d, 100, 1000));
+for (int d = 1; d <= 13; d++)
+    availabilities.Add(new ResourceAvailabilityTest(2, d, 100, 1000, 1000));
 
 // ----------------------
 // Dependencies (index-based)
-// Workload 1 must finish before Workload 2
 // ----------------------
 var dependencies = new List<(int before, int after)>
-        {
-            (0, 1),
-            (2, 3)
-        };
+{
+    (0, 1)
+};
 
 // ----------------------
 // Build model
@@ -65,10 +58,16 @@ for (int w = 0; w < workloads.Count; w++)
         int resourceId = r.Key;
         var days = r.Value;
 
-        if (days.All(d => d.EffectiveLiftTonnes < workload.weightToLiftTonnes))
+        // Validation: weight AND units
+        if (days.All(d =>
+            d.EffectiveLiftTonnes < workload.weightToLiftTonnes ||
+            d.MaximumUnits < workload.unitRequired))
+        {
             continue;
+        }
 
         int minutesPerDay = days.First().TotalMinutes;
+
         int requiredDays = (int)Math.Ceiling(
             workload.durationInMinutes / (double)minutesPerDay
         );
@@ -142,13 +141,25 @@ foreach (var r in resources)
 }
 
 // ----------------------
-// Dependencies
+// Dependencies (FIXED PROPERLY)
 // ----------------------
 foreach (var dep in dependencies)
 {
     int wBefore = dep.before;
     int wAfter = dep.after;
 
+    // 1️⃣ Successor implies predecessor (ANY resource)
+    model.Add(
+        LinearExpr.Sum(
+            presence.Where(p => p.Key.w == wAfter).Select(p => p.Value)
+        )
+        <=
+        LinearExpr.Sum(
+            presence.Where(p => p.Key.w == wBefore).Select(p => p.Value)
+        )
+    );
+
+    // 2️⃣ Temporal ordering (only if both specific resource assignments are chosen)
     foreach (var rBefore in resources.Keys)
     {
         foreach (var rAfter in resources.Keys)
@@ -165,18 +176,16 @@ foreach (var dep in dependencies)
             var presBefore = presence[(wBefore, rBefore)];
             var presAfter = presence[(wAfter, rAfter)];
 
-            // end_before <= start_after
             model.Add(
                 intervalBefore.EndExpr() <= intervalAfter.StartExpr()
-            )
-            .OnlyEnforceIf(new[] { presBefore, presAfter });
+            ).OnlyEnforceIf(new[] { presBefore, presAfter });
         }
     }
 }
 
 
 // ----------------------
-// Objective: maximize scheduled workloads
+// Objective
 // ----------------------
 model.Maximize(LinearExpr.Sum(presence.Values));
 
