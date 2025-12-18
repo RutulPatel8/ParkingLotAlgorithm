@@ -1,32 +1,31 @@
-﻿// ----------------------
+﻿using Google.OrTools.Sat;
+
+// ----------------------
 // Workloads
 // ----------------------
-using Google.OrTools.Sat;
-
 var workloads = new List<WorkloadTest>
 {
-    new WorkloadTest(1, 750, 500, 250),
-    new WorkloadTest(2, 250, 1000, 500)
+    new WorkloadTest(Id: 1, DurationInMinutes: 750, WeightToLiftTonnes: 500, unitRequired: 100),
+    new WorkloadTest(Id: 2, DurationInMinutes: 250, WeightToLiftTonnes: 500, unitRequired: 100),
+    new WorkloadTest(Id: 2, DurationInMinutes: 250, WeightToLiftTonnes: 500, unitRequired: 300)
 };
 
 // ----------------------
 // Resource availability (GLOBAL DAYS)
-// Resource 2 missing Day 9 & 10
 // ----------------------
 var availabilities = new List<ResourceAvailabilityTest>();
 
 for (int d = 1; d <= 13; d++)
-    availabilities.Add(new ResourceAvailabilityTest(1, d, 100, 500, 400));
-
-for (int d = 1; d <= 13; d++)
-    availabilities.Add(new ResourceAvailabilityTest(2, d, 100, 1000, 1000));
+    availabilities.Add(new ResourceAvailabilityTest(
+        resourceId: 1, date: d, totalMinutes: 100,
+        effectiveLiftTonnes: 500, maximumUnits: 400));
 
 // ----------------------
 // Dependencies (index-based)
 // ----------------------
 var dependencies = new List<(int before, int after)>
 {
-    (0, 1)
+    //(0, 1)
 };
 
 // ----------------------
@@ -124,31 +123,40 @@ foreach (var r in resources)
 }
 
 // ----------------------
-// No overlap per resource
+// ✅ PARALLEL CAPACITY CONSTRAINT (NEW API)
 // ----------------------
 foreach (var r in resources)
 {
     int resourceId = r.Key;
+    var days = r.Value;
 
-    var allIntervals = intervals
-        .Where(x => x.Key.r == resourceId)
-        .Select(x => x.Value)
-        .ToList();
+    int capacity = days.First().MaximumUnits;
 
-    allIntervals.AddRange(blockedIntervals[resourceId]);
+    var cumulative = model.AddCumulative(capacity);
 
-    model.AddNoOverlap(allIntervals);
+    // Workload intervals consume unitRequired
+    foreach (var kv in intervals.Where(x => x.Key.r == resourceId))
+    {
+        int w = kv.Key.w;
+        cumulative.AddDemand(kv.Value, workloads[w].unitRequired);
+    }
+
+    // Block unavailable days consume FULL capacity
+    foreach (var blocked in blockedIntervals[resourceId])
+    {
+        cumulative.AddDemand(blocked, capacity);
+    }
 }
 
 // ----------------------
-// Dependencies (FIXED PROPERLY)
+// Dependencies
 // ----------------------
 foreach (var dep in dependencies)
 {
     int wBefore = dep.before;
     int wAfter = dep.after;
 
-    // 1️⃣ Successor implies predecessor (ANY resource)
+    // Successor implies predecessor
     model.Add(
         LinearExpr.Sum(
             presence.Where(p => p.Key.w == wAfter).Select(p => p.Value)
@@ -159,30 +167,26 @@ foreach (var dep in dependencies)
         )
     );
 
-    // 2️⃣ Temporal ordering (only if both specific resource assignments are chosen)
+    // Temporal ordering (only if both assigned)
     foreach (var rBefore in resources.Keys)
     {
         foreach (var rAfter in resources.Keys)
         {
-            if (!intervals.ContainsKey((wBefore, rBefore)))
-                continue;
+            if (!intervals.ContainsKey((wBefore, rBefore))) continue;
+            if (!intervals.ContainsKey((wAfter, rAfter))) continue;
 
-            if (!intervals.ContainsKey((wAfter, rAfter)))
-                continue;
+            var iBefore = intervals[(wBefore, rBefore)];
+            var iAfter = intervals[(wAfter, rAfter)];
 
-            var intervalBefore = intervals[(wBefore, rBefore)];
-            var intervalAfter = intervals[(wAfter, rAfter)];
-
-            var presBefore = presence[(wBefore, rBefore)];
-            var presAfter = presence[(wAfter, rAfter)];
+            var pBefore = presence[(wBefore, rBefore)];
+            var pAfter = presence[(wAfter, rAfter)];
 
             model.Add(
-                intervalBefore.EndExpr() <= intervalAfter.StartExpr()
-            ).OnlyEnforceIf(new[] { presBefore, presAfter });
+                iBefore.EndExpr() <= iAfter.StartExpr()
+            ).OnlyEnforceIf(new[] { pBefore, pAfter });
         }
     }
 }
-
 
 // ----------------------
 // Objective
